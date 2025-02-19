@@ -1,13 +1,47 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
-
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"time"
 
 	"chess-ws-go/internal/config"
+	"chess-ws-go/internal/handlers"
 	"chess-ws-go/internal/platform"
-
+	"chess-ws-go/internal/services"
+	"github.com/gin-gonic/gin"
 )
+
+func NewServer(
+    cfg *config.Config,
+    messageService *services.MessageService,
+) http.Handler {
+
+    router := gin.Default()
+
+    // WebSocket route
+    wsHandler := handlers.NewWebSocketHandler(messageService, cfg)
+	router.GET("/ws", func(c *gin.Context) {
+		wsHandler.UpgradeHandler(c.Writer, c.Request)
+	})
+
+    // HTTP routes (if needed)
+    // router.HandleFunc("/health", healthCheckHandler)
+
+    // Middleware
+    var handler http.Handler = router
+    // handler = loggingMiddleware(handler) 
+    // handler = authMiddleware(handler)    
+    // handler = corsMiddleware(handler)    
+
+    return handler
+}
 
 func main ()  {
 	config, err := config.LoadConfig()
@@ -23,5 +57,6 @@ func main ()  {
         log.Fatal("Error connecting to database:", err)
     }
     defer db.Close() // Close the database connection when the server exits
+
 
 }
