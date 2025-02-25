@@ -34,9 +34,9 @@ require (
 )
 
 require (
-	github.com/corentings/chess/v2 v2.0.5 // indirect
+	github.com/corentings/chess/v2 v2.0.5
 	github.com/gin-gonic/gin v1.10.0
-	github.com/joho/godotenv v1.5.1 // indirect
-	github.com/lib/pq v1.10.9 // indirect
+	github.com/joho/godotenv v1.5.1
+	github.com/lib/pq v1.10.9
 	golang.org/x/exp v0.0.0-20250218142911-aa4b98e5adaa // indirect
 )
