@@ -21,26 +21,6 @@ func NewMessageService() *MessageService {
 	}
 }
 
-func (s *MessageService) MakeMove(conn *websocket.Conn, algebraicMove string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	game, ok := s.games[conn]
-	if !ok {
-			game = chess.NewGame()
-			s.games[conn] = game
-	}
-
-	// Use PushMove with options (if needed)
-	// Example: options := &chess.PushMoveOptions{Strict: true}
-	options := &chess.PushMoveOptions{} // Default options
-	err := game.PushMove(algebraicMove, options)
-	if err != nil {
-			return fmt.Errorf("invalid move: %w", err)
-	}
-
-	return nil
-}
 func (s *MessageService) GetGame(conn *websocket.Conn) *chess.Game {
 	s.mu.Lock()
 	defer s.mu.Unlock()
