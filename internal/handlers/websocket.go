@@ -41,16 +41,20 @@ type WebSocketHandler struct {
 	waitingPlayer  *Player // Player waiting for opponent
 	mu             sync.Mutex
 	messageService *services.MessageService
+	gameService    *services.GameService
 	config         *config.Config
 }
 
 func NewWebSocketHandler(
 	messageService *services.MessageService,
+	gameService *services.GameService,
 	config *config.Config,
 ) *WebSocketHandler {
 	return &WebSocketHandler{
 		sessions:       make(map[string]*GameSession),
+		connections:    make(map[*websocket.Conn]bool),
 		messageService: messageService,
+		gameService:    gameService,
 		config:         config,
 	}
 }
@@ -76,70 +80,64 @@ func (h *WebSocketHandler) UpgradeHandler(w http.ResponseWriter, r *http.Request
 	go h.reader(conn) // Start the reader goroutine
 }
 
-
 func (h *WebSocketHandler) reader(conn *websocket.Conn) {
-    defer conn.Close()
-    for {
-        messageType, p, err := conn.ReadMessage()
-        if err != nil {
-            log.Println("Read error:", err)
-            break
-        }
-
-        if messageType != websocket.TextMessage {
-            continue
-        }
-
-        var message struct {
-            Type    string `json:"type"`
-            Payload struct {
-                Move     string `json:"move"`
-                GameID   string `json:"gameId"`
-                Username string `json:"username"` // Add username field
-            } `json:"payload"`
-        }
-
-        if err := json.Unmarshal(p, &message); err != nil {
-            log.Println("Error unmarshaling message:", err)
-            continue
-        }
-
-        switch message.Type {
-        case "join":
-            h.handleJoinGame(conn, message.Payload.Username)
-        case "move":
-            err := h.handleMove(conn, message.Payload.Move, message.Payload.GameID)
-            if err != nil {
-                h.sendMessage(conn, struct {
-                    Type    string `json:"type"`
-                    Payload string `json:"payload"`
-                }{Type: "error", Payload: err.Error()})
-            }
-        default:
-            log.Println("Unknown message type:", message.Type)
-        }
-    }
-}
-
-func (h *WebSocketHandler) broadcastMessage(message interface{}) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	// Broadcast to all active game sessions
-	for _, session := range h.sessions {
-		// Send to white player
-		if session.White != nil && session.White.Conn != nil {
-			h.sendMessage(session.White.Conn, message)
+	defer conn.Close()
+	for {
+		messageType, p, err := conn.ReadMessage()
+		if err != nil {
+			log.Println("Read error:", err)
+			break
 		}
-		// Send to black player
-		if session.Black != nil && session.Black.Conn != nil {
-			h.sendMessage(session.Black.Conn, message)
-		}
-	}
 
-	// Send to waiting player if exists
-	if h.waitingPlayer != nil && h.waitingPlayer.Conn != nil {
-		h.sendMessage(h.waitingPlayer.Conn, message)
+		if messageType != websocket.TextMessage {
+			continue
+		}
+
+		var message struct {
+			Type    string `json:"type"`
+			Payload struct {
+				Move     string  `json:"move"`
+				GameID   string  `json:"gameId"`
+				Username string  `json:"username"`
+				Accept   bool    `json:"accept"`
+				TimeLeft float64 `json:"timeLeft"`
+				Message  string  `json:"message"`
+			} `json:"payload"`
+		}
+
+		if err := json.Unmarshal(p, &message); err != nil {
+			log.Println("Error unmarshaling message:", err)
+			continue
+		}
+
+		switch message.Type {
+		case "join":
+			h.handleJoinGame(conn, message.Payload.Username)
+		case "move":
+			err := h.handleMove(conn, message.Payload.Move, message.Payload.GameID)
+			if err != nil {
+				h.sendMessage(conn, struct {
+					Type    string `json:"type"`
+					Payload string `json:"payload"`
+				}{Type: "error", Payload: err.Error()})
+			}
+		case "resign":
+			h.handleResign(conn, message.Payload.GameID)
+		case "draw_offer":
+			h.handleDrawOffer(conn, message.Payload.GameID)
+		case "draw_response":
+			h.handleDrawResponse(conn, message.Payload.GameID, message.Payload.Accept)
+		case "time_update":
+			h.handleTimeUpdate(conn, message.Payload.GameID, message.Payload.TimeLeft)
+		case "chat":
+			h.handleChat(conn, message.Payload.GameID, message.Payload.Message)
+		case "reconnect":
+			h.handleReconnect(conn, message.Payload.GameID, message.Payload.Username)
+		case "ping":
+			h.handlePing(conn)
+		default:
+			log.Println("Unknown message type:", message.Type)
+		}
 	}
 }
 
@@ -184,7 +182,7 @@ func (h *WebSocketHandler) handleMove(conn *websocket.Conn, moveStr string, game
 	if playerColor != session.CurrentTurn {
 		return fmt.Errorf("not your turn")
 	}
-	
+
 	err := session.Game.PushMove(moveStr, nil)
 	if err != nil {
 		return fmt.Errorf("invalid move: %w", err)
@@ -317,7 +315,6 @@ func (h *WebSocketHandler) handleJoinGame(conn *websocket.Conn, username string)
 	}
 }
 
-
 // Helper function to determine the winner
 func determineWinner(outcome chess.Outcome) string {
 	switch outcome {
@@ -330,4 +327,415 @@ func determineWinner(outcome chess.Outcome) string {
 	default:
 		return "unknown"
 	}
+}
+
+// handleResign handles a player resigning from a game
+func (h *WebSocketHandler) handleResign(conn *websocket.Conn, gameID string) {
+	h.mu.Lock()
+	session, exists := h.sessions[gameID]
+	h.mu.Unlock()
+
+	if !exists {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: "Game not found"})
+		return
+	}
+
+	// Determine player's color
+	var playerColor chess.Color
+	if conn == session.White.Conn {
+		playerColor = chess.White
+	} else if conn == session.Black.Conn {
+		playerColor = chess.Black
+	} else {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: "Player not in this game"})
+		return
+	}
+
+	// Use game service to handle resignation
+	err := h.gameService.ResignGame(gameID, playerColor)
+	if err != nil {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: err.Error()})
+		return
+	}
+
+	// Check game over and notify players
+	isOver, outcome, method, _ := h.gameService.IsGameOver(gameID)
+	if isOver {
+		gameOverMsg := struct {
+			Type    string `json:"type"`
+			Payload struct {
+				Outcome string `json:"outcome"`
+				Method  string `json:"method"`
+				Winner  string `json:"winner"`
+			} `json:"payload"`
+		}{
+			Type: "gameOver",
+			Payload: struct {
+				Outcome string `json:"outcome"`
+				Method  string `json:"method"`
+				Winner  string `json:"winner"`
+			}{
+				Outcome: outcome.String(),
+				Method:  method.String(),
+				Winner:  determineWinner(outcome),
+			},
+		}
+
+		// Send game over message to both players
+		h.sendMessage(session.White.Conn, gameOverMsg)
+		h.sendMessage(session.Black.Conn, gameOverMsg)
+	}
+}
+
+// handleDrawOffer handles a player offering a draw
+func (h *WebSocketHandler) handleDrawOffer(conn *websocket.Conn, gameID string) {
+	h.mu.Lock()
+	session, exists := h.sessions[gameID]
+	h.mu.Unlock()
+
+	if !exists {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: "Game not found"})
+		return
+	}
+
+	// Determine player's color
+	var playerColor chess.Color
+	var opponent *Player
+	if conn == session.White.Conn {
+		playerColor = chess.White
+		opponent = session.Black
+	} else if conn == session.Black.Conn {
+		playerColor = chess.Black
+		opponent = session.White
+	} else {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: "Player not in this game"})
+		return
+	}
+
+	// Use game service to handle draw offer
+	err := h.gameService.OfferDraw(gameID)
+	if err != nil {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: err.Error()})
+		return
+	}
+
+	// Notify opponent of draw offer
+	drawOfferMsg := struct {
+		Type    string `json:"type"`
+		Payload struct {
+			OfferedBy string `json:"offeredBy"`
+		} `json:"payload"`
+	}{
+		Type: "drawOffer",
+		Payload: struct {
+			OfferedBy string `json:"offeredBy"`
+		}{
+			OfferedBy: playerColor.String(),
+		},
+	}
+
+	h.sendMessage(opponent.Conn, drawOfferMsg)
+}
+
+// handleDrawResponse handles a player's response to a draw offer
+func (h *WebSocketHandler) handleDrawResponse(conn *websocket.Conn, gameID string, accept bool) {
+	h.mu.Lock()
+	session, exists := h.sessions[gameID]
+	h.mu.Unlock()
+
+	if !exists {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: "Game not found"})
+		return
+	}
+
+	var err error
+	if accept {
+		err = h.gameService.AcceptDraw(gameID)
+	} else {
+		err = h.gameService.DeclineDraw(gameID)
+	}
+
+	if err != nil {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: err.Error()})
+		return
+	}
+
+	// If draw was accepted, notify both players of game over
+	if accept {
+		isOver, outcome, method, _ := h.gameService.IsGameOver(gameID)
+		if isOver {
+			gameOverMsg := struct {
+				Type    string `json:"type"`
+				Payload struct {
+					Outcome string `json:"outcome"`
+					Method  string `json:"method"`
+					Winner  string `json:"winner"`
+				} `json:"payload"`
+			}{
+				Type: "gameOver",
+				Payload: struct {
+					Outcome string `json:"outcome"`
+					Method  string `json:"method"`
+					Winner  string `json:"winner"`
+				}{
+					Outcome: outcome.String(),
+					Method:  method.String(),
+					Winner:  "draw",
+				},
+			}
+
+			h.sendMessage(session.White.Conn, gameOverMsg)
+			h.sendMessage(session.Black.Conn, gameOverMsg)
+		}
+	} else {
+		// Notify both players that draw was declined
+		drawResponseMsg := struct {
+			Type    string `json:"type"`
+			Payload struct {
+				Accepted bool `json:"accepted"`
+			} `json:"payload"`
+		}{
+			Type: "drawResponse",
+			Payload: struct {
+				Accepted bool `json:"accepted"`
+			}{
+				Accepted: false,
+			},
+		}
+
+		h.sendMessage(session.White.Conn, drawResponseMsg)
+		h.sendMessage(session.Black.Conn, drawResponseMsg)
+	}
+}
+
+// handleTimeUpdate handles updating a player's remaining time
+func (h *WebSocketHandler) handleTimeUpdate(conn *websocket.Conn, gameID string, timeLeft float64) {
+	h.mu.Lock()
+	session, exists := h.sessions[gameID]
+	h.mu.Unlock()
+
+	if !exists {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: "Game not found"})
+		return
+	}
+
+	// Determine player's color
+	var playerColor chess.Color
+	if conn == session.White.Conn {
+		playerColor = chess.White
+	} else if conn == session.Black.Conn {
+		playerColor = chess.Black
+	} else {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: "Player not in this game"})
+		return
+	}
+
+	// Update time in game service
+	err := h.gameService.UpdateTime(gameID, playerColor, timeLeft)
+	if err != nil {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: err.Error()})
+		return
+	}
+
+	// Broadcast time update to both players
+	timeUpdateMsg := struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Color    string  `json:"color"`
+			TimeLeft float64 `json:"timeLeft"`
+		} `json:"payload"`
+	}{
+		Type: "timeUpdate",
+		Payload: struct {
+			Color    string  `json:"color"`
+			TimeLeft float64 `json:"timeLeft"`
+		}{
+			Color:    playerColor.String(),
+			TimeLeft: timeLeft,
+		},
+	}
+
+	h.sendMessage(session.White.Conn, timeUpdateMsg)
+	h.sendMessage(session.Black.Conn, timeUpdateMsg)
+}
+
+// handleChat handles a chat message from a player
+func (h *WebSocketHandler) handleChat(conn *websocket.Conn, gameID string, message string) {
+	h.mu.Lock()
+	session, exists := h.sessions[gameID]
+	h.mu.Unlock()
+
+	if !exists {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: "Game not found"})
+		return
+	}
+
+	// Determine sender's username
+	var username string
+	if conn == session.White.Conn {
+		username = session.White.Username
+	} else if conn == session.Black.Conn {
+		username = session.Black.Username
+	} else {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: "Player not in this game"})
+		return
+	}
+
+	// Add chat message to game service
+	err := h.gameService.AddChatMessage(gameID, username, message)
+	if err != nil {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: err.Error()})
+		return
+	}
+
+	// Broadcast chat message to both players
+	chatMsg := struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Sender  string `json:"sender"`
+			Message string `json:"message"`
+		} `json:"payload"`
+	}{
+		Type: "chat",
+		Payload: struct {
+			Sender  string `json:"sender"`
+			Message string `json:"message"`
+		}{
+			Sender:  username,
+			Message: message,
+		},
+	}
+
+	h.sendMessage(session.White.Conn, chatMsg)
+	h.sendMessage(session.Black.Conn, chatMsg)
+}
+
+// handleReconnect handles a player reconnecting to a game
+func (h *WebSocketHandler) handleReconnect(conn *websocket.Conn, gameID string, username string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	session, exists := h.sessions[gameID]
+	if !exists {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: "Game not found"})
+		return
+	}
+
+	// Check if username matches either player
+	if session.White.Username == username {
+		// Update white player's connection
+		session.White.Conn = conn
+	} else if session.Black.Username == username {
+		// Update black player's connection
+		session.Black.Conn = conn
+	} else {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: "Player not in this game"})
+		return
+	}
+
+	// Get current game state
+	game, err := h.gameService.GetGame(gameID)
+	if err != nil {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: err.Error()})
+		return
+	}
+
+	gameState, err := h.gameService.GetGameState(gameID)
+	if err != nil {
+		h.sendMessage(conn, struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}{Type: "error", Payload: err.Error()})
+		return
+	}
+
+	// Send current game state to reconnected player
+	gameStateMsg := struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Position    string  `json:"position"`
+			Turn        string  `json:"turn"`
+			WhitePlayer string  `json:"whitePlayer"`
+			BlackPlayer string  `json:"blackPlayer"`
+			WhiteTime   float64 `json:"whiteTime"`
+			BlackTime   float64 `json:"blackTime"`
+		} `json:"payload"`
+	}{
+		Type: "gameState",
+		Payload: struct {
+			Position    string  `json:"position"`
+			Turn        string  `json:"turn"`
+			WhitePlayer string  `json:"whitePlayer"`
+			BlackPlayer string  `json:"blackPlayer"`
+			WhiteTime   float64 `json:"whiteTime"`
+			BlackTime   float64 `json:"blackTime"`
+		}{
+			Position:    game.Position().String(),
+			Turn:        game.Position().Turn().String(),
+			WhitePlayer: gameState.WhitePlayer,
+			BlackPlayer: gameState.BlackPlayer,
+			WhiteTime:   gameState.TimeControl.WhiteTimeLeft,
+			BlackTime:   gameState.TimeControl.BlackTimeLeft,
+		},
+	}
+
+	h.sendMessage(conn, gameStateMsg)
+}
+
+// handlePing responds to ping messages to keep the connection alive
+func (h *WebSocketHandler) handlePing(conn *websocket.Conn) {
+	h.sendMessage(conn, struct {
+		Type string `json:"type"`
+	}{Type: "pong"})
 }
