@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log"
 	"net/http"
 	"os"
@@ -22,6 +23,7 @@ func NewServer(
 	cfg *config.Config,
 	messageService *services.MessageService,
 	gameService *services.GameService,
+	db *sql.DB,
 ) http.Handler {
 
 	router := gin.Default()
@@ -32,8 +34,9 @@ func NewServer(
 		wsHandler.UpgradeHandler(c.Writer, c.Request)
 	})
 
-	// HTTP routes (if needed)
-	// router.HandleFunc("/health", healthCheckHandler)
+	// Health check route
+	healthHandler := handlers.NewHealthHandler(db)
+	router.GET("/health", healthHandler.HealthCheck)
 
 	// Middleware
 	var handler http.Handler = router
@@ -70,7 +73,7 @@ func main() {
 	statsCollector.Start()
 
 	// Create server
-	server := NewServer(config, messageService, gameService)
+	server := NewServer(config, messageService, gameService, db)
 
 	// Configure HTTP server
 	srv := &http.Server{
