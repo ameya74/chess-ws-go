@@ -9,39 +9,88 @@ import (
 	"os/signal"
 	"time"
 
+	"chess-ws-go/internal/auth"
 	"chess-ws-go/internal/config"
 	"chess-ws-go/internal/handlers"
 	"chess-ws-go/internal/middleware"
 	"chess-ws-go/internal/platform"
+	"chess-ws-go/internal/repositories"
 	"chess-ws-go/internal/services"
 	"chess-ws-go/internal/stats"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jmoiron/sqlx"
 )
 
 func NewServer(
 	cfg *config.Config,
 	messageService *services.MessageService,
 	gameService *services.GameService,
+	userRepo repositories.UserRepository,
+	authService *services.AuthService,
 	db *sql.DB,
 ) http.Handler {
 
 	router := gin.Default()
 
-	// WebSocket route
-	wsHandler := handlers.NewWebSocketHandler(messageService, gameService, cfg)
-	router.GET("/ws", func(c *gin.Context) {
-		wsHandler.UpgradeHandler(c.Writer, c.Request)
-	})
+	// Public routes
+	router.GET("/health", handlers.NewHealthHandler(db).HealthCheck)
 
-	// Health check route
-	healthHandler := handlers.NewHealthHandler(db)
-	router.GET("/health", healthHandler.HealthCheck)
+	// Auth routes
+	authHandler := handlers.NewAuthHandler(authService)
+	authGroup := router.Group("/auth")
+	{
+		authGroup.GET("/status", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"status": "Authentication service running"})
+		})
+		authGroup.POST("/login", authHandler.Login)
+		authGroup.POST("/refresh", authHandler.RefreshToken)
+		authGroup.POST("/register", authHandler.Register)
+		authGroup.GET("/verify", authHandler.VerifyEmail)
+	}
+
+	// Protected routes
+	protected := router.Group("")
+	protected.Use(middleware.AuthMiddleware(&cfg.JWT))
+	{
+		// WebSocket route with authentication
+		wsHandler := handlers.NewWebSocketHandler(messageService, gameService, cfg)
+		protected.GET("/ws", func(c *gin.Context) {
+			// Extract user info from context
+			userID := c.GetString("user_id")
+			username := c.GetString("username")
+
+			// Add user info to request context for WebSocket handler
+			c.Request = c.Request.WithContext(
+				context.WithValue(c.Request.Context(), "user_id", userID),
+			)
+			c.Request = c.Request.WithContext(
+				context.WithValue(c.Request.Context(), "username", username),
+			)
+
+			wsHandler.UpgradeHandler(c.Writer, c.Request)
+		})
+
+		// Game management routes (will be implemented later)
+		gameGroup := protected.Group("/game")
+		{
+			// These routes will require CREATE_GAME permission
+			gameGroup.Use(middleware.RequirePermission(auth.PermissionCreateGame))
+			// gameGroup.POST("/create", gameHandler.CreateGame)
+		}
+
+		// Admin routes (will be implemented later)
+		adminGroup := protected.Group("/admin")
+		{
+			// These routes will require ADMIN role
+			adminGroup.Use(middleware.RequireRole(auth.RoleAdmin))
+			// adminGroup.GET("/stats", adminHandler.GetStats)
+		}
+	}
 
 	// Middleware
 	var handler http.Handler = router
 	handler = middleware.LoggingMiddleware(handler)
-	// handler = authMiddleware(handler)
 	handler = middleware.CorsMiddleware(cfg.AllowedOrigins)(handler)
 
 	return handler
@@ -60,9 +109,14 @@ func main() {
 	}
 	defer db.Close() // Close the database connection when the server exits
 
+	// Initialize repositories
+	dbx := sqlx.NewDb(db, "postgres") // Assuming PostgreSQL, adjust if using a different database
+	userRepo := repositories.NewSQLUserRepository(dbx)
+
 	// Initialize services
 	gameService := services.NewGameService()
 	messageService := services.NewMessageService(gameService)
+	authService := services.NewAuthService(userRepo, &config.JWT)
 
 	// Initialize stats collector
 	statsCollector := stats.NewCollector(
@@ -73,7 +127,7 @@ func main() {
 	statsCollector.Start()
 
 	// Create server
-	server := NewServer(config, messageService, gameService, db)
+	server := NewServer(config, messageService, gameService, userRepo, authService, db)
 
 	// Configure HTTP server
 	srv := &http.Server{

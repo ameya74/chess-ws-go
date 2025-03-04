@@ -26,6 +26,7 @@ type Player struct {
 	Conn     *websocket.Conn
 	Color    chess.Color
 	Username string
+	UserID   string
 }
 
 type GameSession struct {
@@ -60,12 +61,29 @@ func NewWebSocketHandler(
 }
 
 func (h *WebSocketHandler) UpgradeHandler(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	// Extract authentication information from request context
+	userID, _ := r.Context().Value("user_id").(string)
+	username, _ := r.Context().Value("username").(string)
+
+	// Validate authentication
+	if userID == "" || username == "" {
+		log.Println("Authentication required for WebSocket connection")
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Set WebSocket protocol for token authentication if needed
+	upgradeHeaders := http.Header{}
+
+	// Upgrade the connection
+	conn, err := upgrader.Upgrade(w, r, upgradeHeaders)
 	if err != nil {
 		log.Println("Upgrade error:", err)
 		return
 	}
 	defer conn.Close()
+
+	log.Printf("User %s (ID: %s) connected via WebSocket", username, userID)
 
 	h.mu.Lock()
 	h.connections[conn] = true
@@ -75,12 +93,15 @@ func (h *WebSocketHandler) UpgradeHandler(w http.ResponseWriter, r *http.Request
 		h.mu.Lock()
 		delete(h.connections, conn)
 		h.mu.Unlock()
+		log.Printf("User %s (ID: %s) disconnected", username, userID)
 	}()
 
-	go h.reader(conn) // Start the reader goroutine
+	// Start the reader goroutine with authenticated user info
+	go h.authenticatedReader(conn, userID, username)
 }
 
-func (h *WebSocketHandler) reader(conn *websocket.Conn) {
+// authenticatedReader is a new method that handles messages with user authentication
+func (h *WebSocketHandler) authenticatedReader(conn *websocket.Conn, userID string, username string) {
 	defer conn.Close()
 	for {
 		messageType, p, err := conn.ReadMessage()
@@ -98,7 +119,6 @@ func (h *WebSocketHandler) reader(conn *websocket.Conn) {
 			Payload struct {
 				Move     string  `json:"move"`
 				GameID   string  `json:"gameId"`
-				Username string  `json:"username"`
 				Accept   bool    `json:"accept"`
 				TimeLeft float64 `json:"timeLeft"`
 				Message  string  `json:"message"`
@@ -110,9 +130,10 @@ func (h *WebSocketHandler) reader(conn *websocket.Conn) {
 			continue
 		}
 
+		// Use the authenticated username instead of relying on the message
 		switch message.Type {
 		case "join":
-			h.handleJoinGame(conn, message.Payload.Username)
+			h.handleJoinGame(conn, username, userID)
 		case "move":
 			err := h.handleMove(conn, message.Payload.Move, message.Payload.GameID)
 			if err != nil {
@@ -130,9 +151,9 @@ func (h *WebSocketHandler) reader(conn *websocket.Conn) {
 		case "time_update":
 			h.handleTimeUpdate(conn, message.Payload.GameID, message.Payload.TimeLeft)
 		case "chat":
-			h.handleChat(conn, message.Payload.GameID, message.Payload.Message)
+			h.handleChat(conn, message.Payload.GameID, message.Payload.Message, username)
 		case "reconnect":
-			h.handleReconnect(conn, message.Payload.GameID, message.Payload.Username)
+			h.handleReconnect(conn, message.Payload.GameID, username, userID)
 		case "ping":
 			h.handlePing(conn)
 		default:
@@ -257,13 +278,14 @@ func (h *WebSocketHandler) handleGameOver(session *GameSession) {
 	}
 }
 
-func (h *WebSocketHandler) handleJoinGame(conn *websocket.Conn, username string) {
+func (h *WebSocketHandler) handleJoinGame(conn *websocket.Conn, username string, userID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	newPlayer := &Player{
 		Conn:     conn,
 		Username: username,
+		UserID:   userID,
 	}
 
 	if h.waitingPlayer == nil {
@@ -593,7 +615,7 @@ func (h *WebSocketHandler) handleTimeUpdate(conn *websocket.Conn, gameID string,
 }
 
 // handleChat handles a chat message from a player
-func (h *WebSocketHandler) handleChat(conn *websocket.Conn, gameID string, message string) {
+func (h *WebSocketHandler) handleChat(conn *websocket.Conn, gameID string, message string, username string) {
 	h.mu.Lock()
 	session, exists := h.sessions[gameID]
 	h.mu.Unlock()
@@ -603,20 +625,6 @@ func (h *WebSocketHandler) handleChat(conn *websocket.Conn, gameID string, messa
 			Type    string `json:"type"`
 			Payload string `json:"payload"`
 		}{Type: "error", Payload: "Game not found"})
-		return
-	}
-
-	// Determine sender's username
-	var username string
-	if conn == session.White.Conn {
-		username = session.White.Username
-	} else if conn == session.Black.Conn {
-		username = session.Black.Username
-	} else {
-		h.sendMessage(conn, struct {
-			Type    string `json:"type"`
-			Payload string `json:"payload"`
-		}{Type: "error", Payload: "Player not in this game"})
 		return
 	}
 
@@ -653,7 +661,7 @@ func (h *WebSocketHandler) handleChat(conn *websocket.Conn, gameID string, messa
 }
 
 // handleReconnect handles a player reconnecting to a game
-func (h *WebSocketHandler) handleReconnect(conn *websocket.Conn, gameID string, username string) {
+func (h *WebSocketHandler) handleReconnect(conn *websocket.Conn, gameID string, username string, userID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
