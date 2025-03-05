@@ -47,6 +47,15 @@ func NewServer(
 		authGroup.POST("/refresh", authHandler.RefreshToken)
 		authGroup.POST("/register", authHandler.Register)
 		authGroup.GET("/verify", authHandler.VerifyEmail)
+
+		// User management routes
+		userService := services.NewUserService(userRepo)
+		userHandler := handlers.NewUserHandler(userService, authService)
+		authGroup.PUT("/profile", userHandler.UpdateProfile)
+		authGroup.DELETE("/account", userHandler.DeleteAccount)
+		authGroup.GET("/users", userHandler.ListUsers)
+		authGroup.POST("/password-reset", userHandler.RequestPasswordReset)
+		authGroup.POST("/password-reset/confirm", userHandler.ConfirmPasswordReset)
 	}
 
 	// Protected routes

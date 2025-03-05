@@ -15,8 +15,9 @@ type User struct {
 	DisplayName  string    `json:"display_name" db:"display_name"`
 
 	// Account status
-	IsVerified        bool   `json:"is_verified" db:"is_verified"`
-	VerificationToken string `json:"-" db:"verification_token"`
+	IsVerified         bool   `json:"is_verified" db:"is_verified"`
+	VerificationToken  string `json:"-" db:"verification_token"`
+	PasswordResetToken string `json:"-" db:"password_reset_token"`
 
 	// Chess stats
 	EloRating int `json:"elo_rating" db:"elo_rating"`
