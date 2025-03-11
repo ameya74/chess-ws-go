@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -8,6 +9,7 @@ import (
 	"sync"
 
 	"chess-ws-go/internal/config"
+	"chess-ws-go/internal/repositories"
 	"chess-ws-go/internal/services"
 
 	"github.com/corentings/chess/v2"
@@ -43,12 +45,14 @@ type WebSocketHandler struct {
 	mu             sync.Mutex
 	messageService *services.MessageService
 	gameService    *services.GameService
+	userRepo       repositories.UserRepository
 	config         *config.Config
 }
 
 func NewWebSocketHandler(
 	messageService *services.MessageService,
 	gameService *services.GameService,
+	userRepo repositories.UserRepository,
 	config *config.Config,
 ) *WebSocketHandler {
 	return &WebSocketHandler{
@@ -56,6 +60,7 @@ func NewWebSocketHandler(
 		connections:    make(map[*websocket.Conn]bool),
 		messageService: messageService,
 		gameService:    gameService,
+		userRepo:       userRepo,
 		config:         config,
 	}
 }
@@ -204,11 +209,19 @@ func (h *WebSocketHandler) handleMove(conn *websocket.Conn, moveStr string, game
 		return fmt.Errorf("not your turn")
 	}
 
-	err := session.Game.PushMove(moveStr, nil)
+	// Create context for database operations
+	ctx := context.Background()
+
+	// Get user repository from the application context
+	userRepo := h.getUserRepository()
+
+	// Make the move using the game service
+	err := h.gameService.MakeMove(gameID, moveStr, ctx, userRepo)
 	if err != nil {
 		return fmt.Errorf("invalid move: %w", err)
 	}
-	// Switch turns
+
+	// Update session state
 	session.CurrentTurn = chess.Color(1 - int(session.CurrentTurn))
 
 	// Broadcast the move to both players
@@ -379,8 +392,14 @@ func (h *WebSocketHandler) handleResign(conn *websocket.Conn, gameID string) {
 		return
 	}
 
+	// Create context for database operations
+	ctx := context.Background()
+
+	// Get user repository from the application context
+	userRepo := h.getUserRepository()
+
 	// Use game service to handle resignation
-	err := h.gameService.ResignGame(gameID, playerColor)
+	err := h.gameService.ResignGame(gameID, playerColor, ctx, userRepo)
 	if err != nil {
 		h.sendMessage(conn, struct {
 			Type    string `json:"type"`
@@ -491,66 +510,108 @@ func (h *WebSocketHandler) handleDrawResponse(conn *websocket.Conn, gameID strin
 		return
 	}
 
-	var err error
-	if accept {
-		err = h.gameService.AcceptDraw(gameID)
+	// Determine player's color
+	var playerColor chess.Color
+	var opponent *Player
+	if conn == session.White.Conn {
+		playerColor = chess.White
+		opponent = session.Black
+	} else if conn == session.Black.Conn {
+		playerColor = chess.Black
+		opponent = session.White
 	} else {
-		err = h.gameService.DeclineDraw(gameID)
-	}
-
-	if err != nil {
 		h.sendMessage(conn, struct {
 			Type    string `json:"type"`
 			Payload string `json:"payload"`
-		}{Type: "error", Payload: err.Error()})
+		}{Type: "error", Payload: "Player not in this game"})
 		return
 	}
 
-	// If draw was accepted, notify both players of game over
 	if accept {
-		isOver, outcome, method, _ := h.gameService.IsGameOver(gameID)
-		if isOver {
-			gameOverMsg := struct {
-				Type    string `json:"type"`
-				Payload struct {
-					Outcome string `json:"outcome"`
-					Method  string `json:"method"`
-					Winner  string `json:"winner"`
-				} `json:"payload"`
-			}{
-				Type: "gameOver",
-				Payload: struct {
-					Outcome string `json:"outcome"`
-					Method  string `json:"method"`
-					Winner  string `json:"winner"`
-				}{
-					Outcome: outcome.String(),
-					Method:  method.String(),
-					Winner:  "draw",
-				},
-			}
+		// Create context for database operations
+		ctx := context.Background()
 
-			h.sendMessage(session.White.Conn, gameOverMsg)
-			h.sendMessage(session.Black.Conn, gameOverMsg)
+		// Get user repository from the application context
+		userRepo := h.getUserRepository()
+
+		// Accept draw
+		err := h.gameService.AcceptDraw(gameID, ctx, userRepo)
+		if err != nil {
+			h.sendMessage(conn, struct {
+				Type    string `json:"type"`
+				Payload string `json:"payload"`
+			}{Type: "error", Payload: err.Error()})
+			return
 		}
-	} else {
-		// Notify both players that draw was declined
-		drawResponseMsg := struct {
+
+		// Notify both players
+		drawAcceptedMsg := struct {
 			Type    string `json:"type"`
 			Payload struct {
-				Accepted bool `json:"accepted"`
+				AcceptedBy string `json:"acceptedBy"`
 			} `json:"payload"`
 		}{
-			Type: "drawResponse",
+			Type: "drawAccepted",
 			Payload: struct {
-				Accepted bool `json:"accepted"`
+				AcceptedBy string `json:"acceptedBy"`
 			}{
-				Accepted: false,
+				AcceptedBy: playerColor.String(),
 			},
 		}
 
-		h.sendMessage(session.White.Conn, drawResponseMsg)
-		h.sendMessage(session.Black.Conn, drawResponseMsg)
+		h.sendMessage(session.White.Conn, drawAcceptedMsg)
+		h.sendMessage(session.Black.Conn, drawAcceptedMsg)
+
+		// Send game over message
+		gameOverMsg := struct {
+			Type    string `json:"type"`
+			Payload struct {
+				Outcome string `json:"outcome"`
+				Method  string `json:"method"`
+				Winner  string `json:"winner"`
+			} `json:"payload"`
+		}{
+			Type: "gameOver",
+			Payload: struct {
+				Outcome string `json:"outcome"`
+				Method  string `json:"method"`
+				Winner  string `json:"winner"`
+			}{
+				Outcome: "Draw",
+				Method:  "Agreement",
+				Winner:  "draw",
+			},
+		}
+
+		h.sendMessage(session.White.Conn, gameOverMsg)
+		h.sendMessage(session.Black.Conn, gameOverMsg)
+	} else {
+		// Decline draw
+		err := h.gameService.DeclineDraw(gameID)
+		if err != nil {
+			h.sendMessage(conn, struct {
+				Type    string `json:"type"`
+				Payload string `json:"payload"`
+			}{Type: "error", Payload: err.Error()})
+			return
+		}
+
+		// Notify opponent
+		drawDeclinedMsg := struct {
+			Type    string `json:"type"`
+			Payload struct {
+				DeclinedBy string `json:"declinedBy"`
+			} `json:"payload"`
+		}{
+			Type: "drawDeclined",
+			Payload: struct {
+				DeclinedBy string `json:"declinedBy"`
+			}{
+				DeclinedBy: playerColor.String(),
+			},
+		}
+
+		h.sendMessage(opponent.Conn, drawDeclinedMsg)
 	}
 }
 
@@ -746,4 +807,9 @@ func (h *WebSocketHandler) handlePing(conn *websocket.Conn) {
 	h.sendMessage(conn, struct {
 		Type string `json:"type"`
 	}{Type: "pong"})
+}
+
+// getUserRepository gets the user repository from the handler
+func (h *WebSocketHandler) getUserRepository() repositories.UserRepository {
+	return h.userRepo
 }

@@ -1,8 +1,12 @@
 package services
 
 import (
+	"context"
 	"fmt"
+	"math"
 	"sync"
+
+	"chess-ws-go/internal/repositories"
 
 	"github.com/corentings/chess/v2"
 	"github.com/google/uuid"
@@ -92,7 +96,7 @@ func (s *GameService) GetGameState(gameID string) (*GameState, error) {
 }
 
 // MakeMove makes a move in a chess game
-func (s *GameService) MakeMove(gameID, moveStr string) error {
+func (s *GameService) MakeMove(gameID, moveStr string, ctx context.Context, userRepo repositories.UserRepository) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -123,11 +127,18 @@ func (s *GameService) MakeMove(gameID, moveStr string) error {
 	// Reset draw offer after a move
 	state.DrawOffered = false
 
+	// Check if the game is over after this move
+	isOver, _, _, _ := s.IsGameOver(gameID)
+	if isOver && ctx != nil && userRepo != nil {
+		// Update ELO ratings if game is over
+		_ = s.UpdatePlayerRatings(ctx, gameID, state.WhitePlayer, state.BlackPlayer, userRepo)
+	}
+
 	return nil
 }
 
 // ResignGame handles a player resigning
-func (s *GameService) ResignGame(gameID string, color chess.Color) error {
+func (s *GameService) ResignGame(gameID string, color chess.Color, ctx context.Context, userRepo repositories.UserRepository) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -136,11 +147,21 @@ func (s *GameService) ResignGame(gameID string, color chess.Color) error {
 		return fmt.Errorf("game not found")
 	}
 
+	state, exists := s.gameStates[gameID]
+	if !exists {
+		return fmt.Errorf("game state not found")
+	}
+
 	// Set the game as resigned
 	if color == chess.White {
 		game.Resign(chess.White)
 	} else {
 		game.Resign(chess.Black)
+	}
+
+	// Update ELO ratings if context and repo are provided
+	if ctx != nil && userRepo != nil {
+		_ = s.UpdatePlayerRatings(ctx, gameID, state.WhitePlayer, state.BlackPlayer, userRepo)
 	}
 
 	return nil
@@ -161,7 +182,7 @@ func (s *GameService) OfferDraw(gameID string) error {
 }
 
 // AcceptDraw accepts a draw offer
-func (s *GameService) AcceptDraw(gameID string) error {
+func (s *GameService) AcceptDraw(gameID string, ctx context.Context, userRepo repositories.UserRepository) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -181,6 +202,12 @@ func (s *GameService) AcceptDraw(gameID string) error {
 
 	// Set the game as drawn by agreement
 	game.Draw(chess.DrawOffer)
+
+	// Update ELO ratings if context and repo are provided
+	if ctx != nil && userRepo != nil {
+		_ = s.UpdatePlayerRatings(ctx, gameID, state.WhitePlayer, state.BlackPlayer, userRepo)
+	}
+
 	return nil
 }
 
@@ -254,4 +281,91 @@ func (s *GameService) GetActiveGamesCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.games)
+}
+
+// CalculateEloChange calculates the ELO rating change based on game outcome
+func calculateEloChange(playerRating, opponentRating int, outcome float64) int {
+	// K-factor determines the maximum possible adjustment
+	// Higher for newer players, lower for established players
+	kFactor := 32
+
+	// Expected score based on ELO difference
+	expectedScore := 1.0 / (1.0 + math.Pow(10, float64(opponentRating-playerRating)/400.0))
+
+	// Calculate ELO change
+	// outcome: 1.0 for win, 0.5 for draw, 0.0 for loss
+	change := int(math.Round(float64(kFactor) * (outcome - expectedScore)))
+
+	return change
+}
+
+// UpdatePlayerRatings updates the ELO ratings of both players after a game
+func (s *GameService) UpdatePlayerRatings(
+	ctx context.Context,
+	gameID string,
+	whiteUserID string,
+	blackUserID string,
+	userRepo repositories.UserRepository,
+) error {
+	// Get game outcome
+	isOver, outcome, _, err := s.IsGameOver(gameID)
+	if err != nil {
+		return err
+	}
+
+	if !isOver {
+		return fmt.Errorf("game is not over yet")
+	}
+
+	// Get player ratings
+	whiteUser, err := userRepo.GetByID(ctx, whiteUserID)
+	if err != nil {
+		return err
+	}
+
+	blackUser, err := userRepo.GetByID(ctx, blackUserID)
+	if err != nil {
+		return err
+	}
+
+	whiteRating := whiteUser.EloRating
+	blackRating := blackUser.EloRating
+
+	// Determine outcome values for ELO calculation
+	var whiteOutcome, blackOutcome float64
+
+	switch outcome {
+	case chess.WhiteWon:
+		whiteOutcome = 1.0
+		blackOutcome = 0.0
+	case chess.BlackWon:
+		whiteOutcome = 0.0
+		blackOutcome = 1.0
+	case chess.Draw:
+		whiteOutcome = 0.5
+		blackOutcome = 0.5
+	default:
+		return fmt.Errorf("invalid game outcome")
+	}
+
+	// Calculate rating changes
+	whiteRatingChange := calculateEloChange(whiteRating, blackRating, whiteOutcome)
+	blackRatingChange := calculateEloChange(blackRating, whiteRating, blackOutcome)
+
+	// Update ratings
+	whiteUser.EloRating += whiteRatingChange
+	blackUser.EloRating += blackRatingChange
+
+	// Save updated ratings
+	err = userRepo.Update(ctx, whiteUser)
+	if err != nil {
+		return err
+	}
+
+	err = userRepo.Update(ctx, blackUser)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

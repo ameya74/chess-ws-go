@@ -63,7 +63,7 @@ func NewServer(
 	protected.Use(middleware.AuthMiddleware(&cfg.JWT))
 	{
 		// WebSocket route with authentication
-		wsHandler := handlers.NewWebSocketHandler(messageService, gameService, cfg)
+		wsHandler := handlers.NewWebSocketHandler(messageService, gameService, userRepo, cfg)
 		protected.GET("/ws", func(c *gin.Context) {
 			// Extract user info from context
 			userID := c.GetString("user_id")
